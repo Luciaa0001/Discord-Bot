@@ -2,3 +2,5 @@ discord.py
 requests
 python-dotenv
 firebase-admin
+asyncio
+functools
