@@ -7,6 +7,8 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
+import asyncio # <-- Add this import
+import functools # <-- Add this import
 
 # Load environment variables from .env file
 load_dotenv()
@@ -24,6 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Firebase Firestore Setup ---
+db = None # Initialize db as None
 if FIREBASE_SERVICE_ACCOUNT_KEY:
     try:
         # Decode the JSON string from environment variable
@@ -34,10 +37,8 @@ if FIREBASE_SERVICE_ACCOUNT_KEY:
         logger.info("Firebase Firestore initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize Firebase: {e}")
-        db = None
 else:
     logger.warning("FIREBASE_SERVICE_ACCOUNT_KEY not set. Webhook configurations will not be persistent.")
-    db = None
 
 # --- Bot Setup ---
 # Define intents needed for the bot
@@ -46,9 +47,11 @@ intents.message_content = True # Required to read message content
 intents.guilds = True        # Required for guild-related events
 intents.members = True       # Required for member-related events (e.g., checking admin roles)
 
+# Initialize the bot with command prefix and intents
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- Firestore Helper Functions ---
+# Modify these functions to use loop.run_in_executor()
 def get_channel_webhook_ref(guild_id, channel_id):
     """Returns a Firestore document reference for a specific channel's webhook config."""
     if db:
@@ -59,40 +62,74 @@ async def set_channel_webhook(guild_id, channel_id, webhook_url):
     """Saves the webhook URL for a specific channel to Firestore."""
     ref = get_channel_webhook_ref(guild_id, channel_id)
     if ref:
-        await ref.set({"webhook_url": webhook_url, "guild_id": str(guild_id), "channel_id": str(channel_id)})
-        return True
+        # Run the synchronous Firestore set operation in a thread pool executor
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,  # Use the default thread pool executor
+                functools.partial(ref.set, {"webhook_url": webhook_url, "guild_id": str(guild_id), "channel_id": str(channel_id)})
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error setting webhook in Firestore: {e}")
+            return False
     return False
 
 async def get_channel_webhook(guild_id, channel_id):
     """Retrieves the webhook URL for a specific channel from Firestore."""
     ref = get_channel_webhook_ref(guild_id, channel_id)
     if ref:
-        doc = await ref.get()
-        if doc.exists:
-            return doc.to_dict().get("webhook_url")
+        # Run the synchronous Firestore get operation in a thread pool executor
+        loop = asyncio.get_running_loop()
+        try:
+            doc = await loop.run_in_executor(
+                None,
+                ref.get
+            )
+            if doc.exists:
+                return doc.to_dict().get("webhook_url")
+        except Exception as e:
+            logger.error(f"Error getting webhook from Firestore: {e}")
+            return None
     return None
 
 async def delete_channel_webhook(guild_id, channel_id):
     """Deletes the webhook URL for a specific channel from Firestore."""
     ref = get_channel_webhook_ref(guild_id, channel_id)
     if ref:
-        await ref.delete()
-        return True
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                ref.delete
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting webhook from Firestore: {e}")
+            return False
     return False
 
 async def get_all_guild_webhooks(guild_id):
     """Retrieves all webhook configurations for a given guild."""
     if db:
-        webhooks = []
-        # Query documents where guild_id matches
-        query = db.collection("discord_webhooks").where("guild_id", "==", str(guild_id))
-        docs = await query.get()
-        for doc in docs:
-            webhooks.append(doc.to_dict())
-        return webhooks
+        loop = asyncio.get_running_loop()
+        try:
+            # Firestore queries also need to be run in executor
+            query_ref = db.collection("discord_webhooks").where("guild_id", "==", str(guild_id))
+            docs = await loop.run_in_executor(
+                None,
+                query_ref.get
+            )
+            webhooks = []
+            for doc in docs:
+                webhooks.append(doc.to_dict())
+            return webhooks
+        except Exception as e:
+            logger.error(f"Error getting all guild webhooks from Firestore: {e}")
+            return []
     return []
 
-# --- Bot Events ---
+# --- Bot Events (Tidak ada perubahan di sini, karena pemanggilan helper sudah awaitable) ---
 @bot.event
 async def on_ready():
     """Event handler when the bot is ready."""
@@ -102,7 +139,7 @@ async def on_ready():
         f"client_id={bot.user.id}&permissions=277025508352&scope=bot%20applications.commands"
     )
     logger.info(f"Invite the bot using this link:\n{invite_link}")
-
+    # Register slash commands globally (or per guild for faster updates during development)
     try:
         await bot.tree.sync() # Syncs commands globally, might take up to an hour
         # For testing, you can sync to a specific guild for faster updates:
@@ -118,26 +155,30 @@ async def on_ready():
 async def on_message(message):
     """Event handler for new messages."""
     if message.author.bot:
-        return
+        return # Ignore messages from bots
 
-
+    # Check if the message is a DM or a mention
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mention = bot.user.mentioned_in(message)
 
+    # Check if the channel has a webhook setup
     channel_webhook_url = None
     if message.guild:
         channel_webhook_url = await get_channel_webhook(message.guild.id, message.channel.id)
 
+    # Only process if it's a DM, a mention, or in a channel with a setup webhook
     if not (is_dm or is_mention or channel_webhook_url):
-        await bot.process_commands(message) 
+        await bot.process_commands(message) # Still process potential prefix commands
         return
 
     logger.info(f"Processing message from {message.author} in {message.channel.name if message.guild else 'DM'}: {message.content}")
 
-
+    # Remove mention if it exists
     mention_text = f"<@{bot.user.id}>"
     clean_content = message.content.replace(mention_text, "").strip()
 
+    # Determine the target webhook URL
+    # If a channel-specific webhook is set, use that. Otherwise, use the global WEBHOOK_URL.
     target_webhook_url = channel_webhook_url if channel_webhook_url else WEBHOOK_URL
 
     if not target_webhook_url:
@@ -146,6 +187,7 @@ async def on_message(message):
         await bot.process_commands(message)
         return
 
+    # Build payload
     payload = {
         "user": {
             "id": str(message.author.id),
@@ -188,12 +230,12 @@ async def on_message(message):
         logger.error(f"Failed to send webhook: {e}")
         await message.channel.send(f"Error sending message to webhook: {e}")
 
-    await bot.process_commands(message) 
+    await bot.process_commands(message) # Important: Process commands after on_message logic
 
-
+# --- Slash Commands (Tidak ada perubahan di sini, karena pemanggilan helper sudah awaitable) ---
 
 @bot.tree.command(name="setup", description="Set up n8n webhook for this channel")
-@commands.has_permissions(manage_channels=True) 
+@commands.has_permissions(manage_channels=True) # Only allow users with manage_channels permission
 async def setup(interaction: discord.Interaction):
     """Sets up the current channel to send messages to the n8n webhook."""
     if not db:
@@ -204,7 +246,7 @@ async def setup(interaction: discord.Interaction):
         await interaction.response.send_message("This command can only be used in a server channel.", ephemeral=True)
         return
 
-
+    # Use the global WEBHOOK_URL as the default for setup
     if not WEBHOOK_URL:
         await interaction.response.send_message("Error: Global WEBHOOK_URL is not configured. Please set it in environment variables.", ephemeral=True)
         return
@@ -214,7 +256,7 @@ async def setup(interaction: discord.Interaction):
         await interaction.response.send_message(
             f"Successfully set up n8n webhook for this channel (`{interaction.channel.name}`). "
             "Messages sent here will now be forwarded to n8n.",
-            ephemeral=False 
+            ephemeral=False # Make it visible to everyone
         )
         logger.info(f"Webhook setup for channel {interaction.channel.name} ({interaction.channel.id}) in guild {interaction.guild.name} ({interaction.guild.id})")
     else:
@@ -272,7 +314,7 @@ async def list_webhooks(interaction: discord.Interaction):
         channel_name = channel.name if channel else f"Unknown Channel ({channel_id})"
         response_message += f"- **#{channel_name}**: `{webhook_data.get('webhook_url', 'N/A')}`\n"
 
-    await interaction.response.send_message(response_message, ephemeral=True) 
+    await interaction.response.send_message(response_message, ephemeral=True) # Ephemeral for privacy
 
 @bot.tree.command(name="status", description="Show webhook status for this channel")
 async def status(interaction: discord.Interaction):
@@ -328,8 +370,8 @@ async def privacy(interaction: discord.Interaction):
 async def stats(interaction: discord.Interaction):
     """Shows basic statistics about the bot."""
     guild_count = len(bot.guilds)
-    user_count = sum(guild.member_count for guild in bot.guilds) 
-    
+    user_count = sum(guild.member_count for guild in bot.guilds) # This might be slow for many guilds
+
     await interaction.response.send_message(
         f"**Bot Statistics:**\n"
         f"- Servers: {guild_count}\n"
@@ -339,7 +381,7 @@ async def stats(interaction: discord.Interaction):
     )
 
 
-
+# --- Error Handling for Slash Commands ---
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: commands.CommandError):
     if isinstance(error, commands.MissingPermissions):
@@ -355,7 +397,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: commands
             ephemeral=True
         )
 
-
+# --- Main Execution ---
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         logger.error("DISCORD_TOKEN is not set. Exiting.")
@@ -364,6 +406,6 @@ if __name__ == "__main__":
         logger.warning("WEBHOOK_URL is not set. The bot will not be able to send data to n8n without it, but slash commands will still work.")
     if not FIREBASE_SERVICE_ACCOUNT_KEY:
         logger.error("FIREBASE_SERVICE_ACCOUNT_KEY is not set. Webhook configurations will not be persistent. Exiting.")
-        exit(1) 
+        exit(1) # Exit if Firebase is not configured for persistence
 
     bot.run(DISCORD_TOKEN)
