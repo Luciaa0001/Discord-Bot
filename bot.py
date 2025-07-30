@@ -230,13 +230,15 @@ async def on_message(message):
         logger.error(f"Failed to send webhook: {e}")
         await message.channel.send(f"Error sending message to webhook: {e}")
 
-    await bot.process_commands(message) # Important: Process commands after on_message logic
-
-# --- Slash Commands (Tidak ada perubahan di sini, karena pemanggilan helper sudah awaitable) ---
+    await bot.process_commands(message) 
 
 @bot.tree.command(name="setup", description="Set up n8n webhook for this channel")
-@commands.has_permissions(manage_channels=True) # Only allow users with manage_channels permission
-async def setup(interaction: discord.Interaction):
+@discord.app_commands.describe(webhook_url="The n8n webhook URL to set for this channel (optional)") # <-- Tambahkan ini
+@commands.has_permissions(manage_channels=True)
+async def setup(
+    interaction: discord.Interaction,
+    webhook_url: str = None # <-- Tambahkan parameter ini dengan default None
+):
     """Sets up the current channel to send messages to the n8n webhook."""
     if not db:
         await interaction.response.send_message("Database not initialized. Cannot set up webhook.", ephemeral=True)
@@ -246,22 +248,25 @@ async def setup(interaction: discord.Interaction):
         await interaction.response.send_message("This command can only be used in a server channel.", ephemeral=True)
         return
 
-    # Use the global WEBHOOK_URL as the default for setup
-    if not WEBHOOK_URL:
-        await interaction.response.send_message("Error: Global WEBHOOK_URL is not configured. Please set it in environment variables.", ephemeral=True)
+    # Tentukan URL yang akan digunakan: jika user memberikan webhook_url, gunakan itu; jika tidak, gunakan WEBHOOK_URL global
+    target_webhook_url = webhook_url if webhook_url else WEBHOOK_URL
+
+    if not target_webhook_url:
+        await interaction.response.send_message("Error: No webhook URL provided and global WEBHOOK_URL is not configured. Please provide a URL or set the global WEBHOOK_URL environment variable.", ephemeral=True)
         return
 
-    success = await set_channel_webhook(interaction.guild.id, interaction.channel.id, WEBHOOK_URL)
+    success = await set_channel_webhook(interaction.guild.id, interaction.channel.id, target_webhook_url) # <-- Gunakan target_webhook_url
     if success:
         await interaction.response.send_message(
             f"Successfully set up n8n webhook for this channel (`{interaction.channel.name}`). "
-            "Messages sent here will now be forwarded to n8n.",
-            ephemeral=False # Make it visible to everyone
+            f"Messages sent here will now be forwarded to: `{target_webhook_url}`", # <-- Tampilkan URL yang disetel
+            ephemeral=False
         )
-        logger.info(f"Webhook setup for channel {interaction.channel.name} ({interaction.channel.id}) in guild {interaction.guild.name} ({interaction.guild.id})")
+        logger.info(f"Webhook setup for channel {interaction.channel.name} ({interaction.channel.id}) in guild {interaction.guild.name} ({interaction.guild.id}) with URL: {target_webhook_url}")
     else:
         await interaction.response.send_message("Failed to set up webhook. Please check bot permissions or database connection.", ephemeral=True)
 
+# ... (perintah slash lainnya tetap sama)
 @bot.tree.command(name="remove", description="Remove n8n webhook from this channel")
 @commands.has_permissions(manage_channels=True)
 async def remove(interaction: discord.Interaction):
